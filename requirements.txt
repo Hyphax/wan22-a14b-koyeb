@@ -1,0 +1,13 @@
+fastapi==0.115.0
+uvicorn[standard]==0.30.6
+transformers>=4.44.0
+accelerate>=0.34.0
+pillow
+imageio
+imageio-ffmpeg
+requests
+# Torch CUDA 12.1 wheels
+torch==2.4.1+cu121
+torchvision==0.19.1+cu121
+torchaudio==2.4.1+cu121
+--extra-index-url https://download.pytorch.org/whl/cu121
