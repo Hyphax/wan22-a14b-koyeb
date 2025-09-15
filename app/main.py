@@ -1,4 +1,4 @@
-import os, uuid, threading, inspect
+import os, uuid, threading, inspect, traceback
 from typing import Optional
 from fastapi import FastAPI, BackgroundTasks, HTTPException
 from pydantic import BaseModel
@@ -33,8 +33,8 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 class GenerateRequest(BaseModel):
     prompt: str
     width: int = 960
-    height: int = 544          # 544 (not 540) to satisfy /16 rule
-    num_frames: int = 25
+    height: int = 544           # /16
+    num_frames: int = 25        # will be normalized below
     steps: int = 28
     guidance_scale: float = 4.0
     negative_prompt: Optional[str] = None
@@ -45,24 +45,25 @@ def _load_pipeline():
     from diffusers import DiffusionPipeline
 
     model_id = os.getenv("WAN_MODEL_ID", "Wan-AI/Wan2.2-T2V-A14B-Diffusers")
-
-    # Load dynamically (no hard imports). bfloat16 on GPU.
     _pipe = DiffusionPipeline.from_pretrained(
         model_id, torch_dtype=torch.bfloat16, cache_dir=MODELS_DIR
     )
     _pipe.to("cuda")
 
-    # Memory-friendly toggles
-    try: _pipe.enable_attention_slicing("max")
-    except Exception: pass
-    try: _pipe.enable_vae_slicing()
-    except Exception: pass
+    # memory-friendly toggles
+    for fn in ("enable_attention_slicing", "enable_vae_slicing"):
+        if hasattr(_pipe, fn):
+            try:
+                getattr(_pipe, fn)("max") if fn == "enable_attention_slicing" else getattr(_pipe, fn)()
+            except Exception:
+                pass
     try:
         if hasattr(_pipe, "vae") and hasattr(_pipe.vae, "enable_tiling"):
             _pipe.vae.enable_tiling()
-    except Exception: pass
+    except Exception:
+        pass
 
-    # Speed bump (safe on A100)
+    # speed bump (A100-safe)
     try:
         import torch
         torch.backends.cuda.matmul.allow_tf32 = True
@@ -79,7 +80,7 @@ def _ensure_pipe():
             if pipe is None:
                 pipe = _load_pipeline()
 
-# ---- Warmup in background (non-blocking startup)
+# ---- Warmup: load only (no tiny render to avoid shape errors)
 WARMUP = os.getenv("WARMUP", "1") == "1"
 
 @app.on_event("startup")
@@ -89,13 +90,39 @@ def _startup():
     def _bg():
         try:
             _ensure_pipe()
-            # tiny warm pass (all /16)
-            _ = pipe(prompt="warmup", height=192, width=320, num_frames=4,
-                     num_inference_steps=3, guidance_scale=3.0)
-            print("Warmup done.")
+            print("Warmup load done.")
         except Exception as e:
-            print("Warmup error:", e)
+            print("Warmup load error:", e)
     threading.Thread(target=_bg, daemon=True).start()
+
+def _normalize_hw(width: int, height: int):
+    """snap to multiples of 16 and keep >=256"""
+    def floor16(x: int) -> int: return max(256, (int(x) // 16) * 16)
+    return floor16(width), floor16(height)
+
+def _normalize_frames(nf: int):
+    """WAN requires (nf - 1) % 4 == 0; snap to nearest valid >= 9."""
+    nf = max(9, int(nf))
+    # round to nearest (k*4 + 1)
+    k = round((nf - 1) / 4)
+    return int(k * 4 + 1)
+
+def _safe_infer(pipeline, **kw):
+    import torch
+    try:
+        return pipeline(**kw)
+    except torch.cuda.OutOfMemoryError:
+        # last-resort: enable CPU offload + smaller recipe
+        torch.cuda.empty_cache()
+        try:
+            if hasattr(pipeline, "enable_model_cpu_offload"):
+                pipeline.enable_model_cpu_offload()
+        except Exception:
+            pass
+        kw["width"], kw["height"] = 960, 544
+        kw["num_frames"] = min(25, kw.get("num_frames", 25))
+        kw["num_inference_steps"] = min(28, kw.get("num_inference_steps", 28))
+        return pipeline(**kw)
 
 def _run_job(job_id: str, req: GenerateRequest):
     import torch
@@ -103,52 +130,42 @@ def _run_job(job_id: str, req: GenerateRequest):
     try:
         _ensure_pipe()
 
-        # snap sizes to multiples of 16 (diffusers requirement)
-        def _floor16(x: int) -> int:
-            return max(256, (int(x) // 16) * 16)
-        w16 = _floor16(req.width)
-        h16 = _floor16(req.height)
+        w16, h16 = _normalize_hw(req.width, req.height)
+        nf_ok = _normalize_frames(req.num_frames)
+        steps = max(10, int(req.steps))  # keep sane minimum
 
         gen = None
         if req.seed is not None:
             gen = torch.Generator(device="cuda").manual_seed(int(req.seed))
 
-        def do_infer(w, h, nf, st):
-            kw = dict(
-                prompt=req.prompt,
-                negative_prompt=req.negative_prompt,
-                height=h, width=w,
-                num_frames=nf,
-                guidance_scale=req.guidance_scale,
-                num_inference_steps=st,
-            )
-            if gen is not None:
-                kw["generator"] = gen
-            return pipe(**kw)
+        kw = dict(
+            prompt=req.prompt,
+            negative_prompt=req.negative_prompt,
+            height=h16, width=w16,
+            num_frames=nf_ok,
+            guidance_scale=req.guidance_scale,
+            num_inference_steps=steps,
+        )
+        if gen is not None:
+            kw["generator"] = gen
 
-        # try user (snapped) first; on OOM, auto-fallback safer + optional cpu offload
-        try:
-            out = do_infer(w16, h16, req.num_frames, req.steps)
-        except torch.cuda.OutOfMemoryError:
-            try:
-                if hasattr(pipe, "enable_model_cpu_offload"):
-                    pipe.enable_model_cpu_offload()
-            except Exception:
-                pass
-            torch.cuda.empty_cache()
-            out = do_infer(960, 544, min(25, req.num_frames), min(28, req.steps))
-
+        out = _safe_infer(pipe, **kw)
         frames = out.frames[0]
+
         out_path = os.path.join(OUT_DIR, f"{job_id}.mp4")
         export_to_video(frames, out_path, fps=24)
 
         with JOBS_LOCK:
             JOBS[job_id]["status"] = "done"
             JOBS[job_id]["file"] = out_path
+
     except Exception as e:
+        # always provide a readable error
+        msg = f"{e.__class__.__name__}: {e}"
+        tb = traceback.format_exc(limit=2)
         with JOBS_LOCK:
             JOBS[job_id]["status"] = "error"
-            JOBS[job_id]["error"] = str(e)
+            JOBS[job_id]["error"] = msg + "\n" + tb
 
 @app.get("/healthz")
 def healthz():
