@@ -1,4 +1,4 @@
-import os, uuid, threading
+import os, uuid, threading, inspect
 from typing import Optional
 from fastapi import FastAPI, BackgroundTasks, HTTPException
 from pydantic import BaseModel
@@ -7,39 +7,35 @@ from fastapi.middleware.cors import CORSMiddleware
 
 # ---- SDPA compat shim: ignore enable_gqa if Torch is older than 2.5
 try:
-    import inspect
     import torch.nn.functional as F
     if "enable_gqa" not in inspect.signature(F.scaled_dot_product_attention).parameters:
         _orig_sdp = F.scaled_dot_product_attention
         def _sdp_compat(*args, enable_gqa=False, **kwargs):
-            # simply ignore enable_gqa on older torch
             return _orig_sdp(*args, **kwargs)
-        F.scaled_dot_product_attention = _sdp_compat  # monkey-patch
+        F.scaled_dot_product_attention = _sdp_compat
 except Exception:
     pass
 
-# ==== Storage paths
 MODELS_DIR = os.getenv("MODELS_DIR", "/models")
 OUT_DIR = os.getenv("OUT_DIR", "/data/outputs")
 os.makedirs(OUT_DIR, exist_ok=True)
 
-# ==== Simple in-memory job store (single replica)
-JOBS = {}  # id -> dict(status,file,error)
+JOBS = {}
 JOBS_LOCK = threading.Lock()
 
-# ==== Lazy-loaded pipeline
 pipe = None
 pipe_lock = threading.Lock()
 
 app = FastAPI(title="WAN 2.2 T2V-A14B API")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
+# ---------- safer defaults (fit A100 80GB reliably)
 class GenerateRequest(BaseModel):
     prompt: str
-    width: int = 1280     # 720p
-    height: int = 720
-    num_frames: int = 81  # ~3.4s @24fps (keeps inference fast)
-    steps: int = 50
+    width: int = 960
+    height: int = 540
+    num_frames: int = 25
+    steps: int = 28
     guidance_scale: float = 4.0
     negative_prompt: Optional[str] = None
     seed: Optional[int] = None
@@ -54,16 +50,28 @@ def _load_pipeline():
     vae = AutoencoderKLWan.from_pretrained(
         model_id, subfolder="vae", torch_dtype=torch.float32, cache_dir=MODELS_DIR
     )
-    dtype = torch.bfloat16
     _pipe = WanPipeline.from_pretrained(
-        model_id, vae=vae, torch_dtype=dtype, cache_dir=MODELS_DIR
-    )
-    _pipe.to("cuda")
+        model_id, vae=vae, torch_dtype=torch.bfloat16, cache_dir=MODELS_DIR
+    ).to("cuda")
+
+    # Memory-friendly toggles (defensive)
+    try: _pipe.enable_attention_slicing("max")
+    except Exception: pass
+    try: _pipe.enable_vae_slicing()
+    except Exception: pass
     try:
+        if hasattr(_pipe, "vae") and hasattr(_pipe.vae, "enable_tiling"):
+            _pipe.vae.enable_tiling()
+    except Exception: pass
+
+    # Speed bump (safe on A100)
+    try:
+        import torch
         torch.backends.cuda.matmul.allow_tf32 = True
+        torch.set_float32_matmul_precision("high")
+        torch.set_grad_enabled(False)
     except Exception:
         pass
-    torch.set_grad_enabled(False)
     return _pipe
 
 def _ensure_pipe():
@@ -73,33 +81,49 @@ def _ensure_pipe():
             if pipe is None:
                 pipe = _load_pipeline()
 
-def _run_job(job_id: str, req: GenerateRequest):
-    from diffusers.utils import export_to_video
-    import torch
+# Warmup so first real job is fast(er)
+WARMUP = os.getenv("WARMUP", "1") == "1"
+@app.on_event("startup")
+def _warmup():
+    if not WARMUP:
+        return
     try:
         _ensure_pipe()
-        with JOBS_LOCK:
-            JOBS[job_id]["status"] = "running"
+        _ = pipe(prompt="warmup", height=192, width=320, num_frames=8,
+                 num_inference_steps=4, guidance_scale=3.5)
+    except Exception as e:
+        print("Warmup error:", e)
 
+def _run_job(job_id: str, req: GenerateRequest):
+    import torch
+    from diffusers.utils import export_to_video
+    try:
+        _ensure_pipe()
         gen = None
         if req.seed is not None:
             gen = torch.Generator(device="cuda").manual_seed(int(req.seed))
 
-        kwargs = dict(
-            prompt=req.prompt,
-            negative_prompt=req.negative_prompt,
-            height=req.height,
-            width=req.width,
-            num_frames=req.num_frames,
-            guidance_scale=req.guidance_scale,
-            num_inference_steps=req.steps,
-        )
-        if gen is not None:
-            kwargs["generator"] = gen
+        def do_infer(w, h, nf, st):
+            kw = dict(
+                prompt=req.prompt,
+                negative_prompt=req.negative_prompt,
+                height=h, width=w,
+                num_frames=nf,
+                guidance_scale=req.guidance_scale,
+                num_inference_steps=st,
+            )
+            if gen is not None:
+                kw["generator"] = gen
+            return pipe(**kw)
 
-        out = pipe(**kwargs)
-        frames = out.frames[0]  # list of PIL images
+        # Try user params first; on OOM, auto-fallback to safe profile
+        try:
+            out = do_infer(req.width, req.height, req.num_frames, req.steps)
+        except torch.cuda.OutOfMemoryError:
+            torch.cuda.empty_cache()
+            out = do_infer(960, 540, min(25, req.num_frames), min(28, req.steps))
 
+        frames = out.frames[0]
         out_path = os.path.join(OUT_DIR, f"{job_id}.mp4")
         export_to_video(frames, out_path, fps=24)
 
@@ -119,9 +143,9 @@ def healthz():
 def generate(req: GenerateRequest, bg: BackgroundTasks):
     job_id = uuid.uuid4().hex
     with JOBS_LOCK:
-        JOBS[job_id] = {"status": "queued", "file": None, "error": None}
+        JOBS[job_id] = {"status": "running", "file": None, "error": None}
     bg.add_task(_run_job, job_id, req)
-    return {"job_id": job_id, "status": "queued"}
+    return {"job_id": job_id, "status": "running"}
 
 @app.get("/jobs/{job_id}")
 def job_status(job_id: str):
