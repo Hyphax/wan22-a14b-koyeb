@@ -1,21 +1,44 @@
-fastapi==0.115.0
-uvicorn[standard]==0.30.6
-transformers>=4.44.0
-accelerate>=0.34.0
-pillow
-imageio
-imageio-ffmpeg
-requests
-ftfy==6.2.0
-einops
-scipy
-timm
-safetensors
-sentencepiece
-numpy
+FROM nvidia/cuda:12.1.1-cudnn8-runtime-ubuntu22.04
 
-# PyTorch >= 2.5 (CUDA 12.1 wheels)
-torch==2.5.1+cu121
-torchvision==0.20.1+cu121
-torchaudio==2.5.1+cu121
---extra-index-url https://download.pytorch.org/whl/cu121
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    HF_HUB_ENABLE_HF_TRANSFER=1 \
+    MODELS_DIR=/models \
+    OUT_DIR=/data/outputs \
+    PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:256,expandable_segments:True \
+    HF_HOME=/models \
+    HUGGINGFACE_HUB_CACHE=/models
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3 python3-pip python3-venv ffmpeg git ca-certificates && \
+    ln -s /usr/bin/python3 /usr/bin/python && \
+    pip install --no-cache-dir --upgrade pip && \
+    mkdir -p ${MODELS_DIR} ${OUT_DIR}
+
+WORKDIR /app
+COPY requirements.txt /app/requirements.txt
+
+# Force the exact Torch we want (2.5.1 + cu121) and deps
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Make HF downloads reliable/fast
+RUN pip install --no-cache-dir --upgrade huggingface_hub==0.25.2 hf_transfer
+
+# Wan 2.2 needs diffusers from GitHub
+RUN pip install --no-cache-dir "git+https://github.com/huggingface/diffusers"
+
+# Log versions at build time (helps verify)
+RUN python - <<'PY'
+import torch, sys
+import diffusers, transformers
+print("PYTORCH:", torch.__version__)
+print("CUDA available:", torch.cuda.is_available())
+print("DIFFUSERS:", diffusers.__version__)
+print("TRANSFORMERS:", transformers.__version__)
+PY
+
+COPY app /app/app
+COPY start.sh /app/start.sh
+EXPOSE 8000
+CMD ["/bin/bash", "/app/start.sh"]
