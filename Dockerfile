@@ -11,17 +11,21 @@ ENV DEBIAN_FRONTEND=noninteractive \
     HUGGINGFACE_HUB_CACHE=/models
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    python3 python3-pip python3-venv ffmpeg git ca-certificates && \
+    python3 python3-pip python3-venv ffmpeg git ca-certificates libgl1 && \
     ln -s /usr/bin/python3 /usr/bin/python && \
-    pip install --no-cache-dir --upgrade pip && \
+    pip install --no-cache-dir --upgrade pip setuptools wheel && \
     mkdir -p ${MODELS_DIR} ${OUT_DIR}
 
 WORKDIR /app
 COPY requirements.txt /app/requirements.txt
+
+# Install deps (Torch 2.5.1 + CUDA 12.1 + extras) from requirements
 RUN pip install --no-cache-dir -r requirements.txt
-# Make HF downloads more reliable & fast
-RUN pip install --no-cache-dir --upgrade huggingface_hub==0.25.2 hf_transfer
-# Wan 2.2 needs diffusers from source
+
+# Make sure hub client is recent
+RUN pip install --no-cache-dir --upgrade huggingface_hub==0.25.2
+
+# Wan 2.2 needs diffusers from GitHub (latest)
 RUN pip install --no-cache-dir "git+https://github.com/huggingface/diffusers"
 
 COPY app /app/app
