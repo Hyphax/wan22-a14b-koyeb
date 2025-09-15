@@ -1,20 +1,20 @@
-FROM nvidia/cuda:12.1.1-cudnn8-runtime-ubuntu22.04
+FROM python:3.11-slim
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     HF_HUB_ENABLE_HF_TRANSFER=1 \
-    MODELS_DIR=/models \
-    OUT_DIR=/data/outputs \
-    PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:256,expandable_segments:True \
-    HF_HOME=/models \
-    HUGGINGFACE_HUB_CACHE=/models
+    MODELS_DIR=/tmp/models \
+    OUT_DIR=/tmp/outputs \
+    HF_HOME=/tmp/models \
+    HUGGINGFACE_HUB_CACHE=/tmp/models \
+    KOYEB_DEPLOYMENT=1
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    python3 python3-pip python3-venv ffmpeg git ca-certificates libgl1 && \
-    ln -s /usr/bin/python3 /usr/bin/python && \
+    ffmpeg git ca-certificates && \
     pip install --no-cache-dir --upgrade pip setuptools wheel && \
-    mkdir -p ${MODELS_DIR} ${OUT_DIR}
+    mkdir -p ${MODELS_DIR} ${OUT_DIR} && \
+    apt-get clean && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 COPY requirements.txt /app/requirements.txt
