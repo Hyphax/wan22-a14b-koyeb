@@ -5,6 +5,19 @@ from pydantic import BaseModel
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 
+# ---- SDPA compat shim: ignore enable_gqa if Torch is older than 2.5
+try:
+    import inspect
+    import torch.nn.functional as F
+    if "enable_gqa" not in inspect.signature(F.scaled_dot_product_attention).parameters:
+        _orig_sdp = F.scaled_dot_product_attention
+        def _sdp_compat(*args, enable_gqa=False, **kwargs):
+            # simply ignore enable_gqa on older torch
+            return _orig_sdp(*args, **kwargs)
+        F.scaled_dot_product_attention = _sdp_compat  # monkey-patch
+except Exception:
+    pass
+
 # ==== Storage paths
 MODELS_DIR = os.getenv("MODELS_DIR", "/models")
 OUT_DIR = os.getenv("OUT_DIR", "/data/outputs")
