@@ -5,7 +5,7 @@ from pydantic import BaseModel
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 
-# ---- SDPA compat shim: ignore enable_gqa if Torch is older than 2.5
+# ---- SDPA compat shim: ignore enable_gqa if Torch < 2.5
 try:
     import torch.nn.functional as F
     if "enable_gqa" not in inspect.signature(F.scaled_dot_product_attention).parameters:
@@ -29,11 +29,11 @@ pipe_lock = threading.Lock()
 app = FastAPI(title="WAN 2.2 T2V-A14B API")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
-# ---------- safer defaults (fit A100 80GB reliably)
+# ---------- safe defaults (multiples of 16; fit A100 80GB)
 class GenerateRequest(BaseModel):
     prompt: str
     width: int = 960
-    height: int = 540
+    height: int = 544          # 544 (not 540) to satisfy /16 rule
     num_frames: int = 25
     steps: int = 28
     guidance_scale: float = 4.0
@@ -42,19 +42,17 @@ class GenerateRequest(BaseModel):
 
 def _load_pipeline():
     import torch
-    from diffusers import WanPipeline, AutoencoderKLWan
+    from diffusers import DiffusionPipeline
 
     model_id = os.getenv("WAN_MODEL_ID", "Wan-AI/Wan2.2-T2V-A14B-Diffusers")
 
-    # VAE on CPU float32; main model bf16 on GPU
-    vae = AutoencoderKLWan.from_pretrained(
-        model_id, subfolder="vae", torch_dtype=torch.float32, cache_dir=MODELS_DIR
+    # Load dynamically (no hard imports). bfloat16 on GPU.
+    _pipe = DiffusionPipeline.from_pretrained(
+        model_id, torch_dtype=torch.bfloat16, cache_dir=MODELS_DIR
     )
-    _pipe = WanPipeline.from_pretrained(
-        model_id, vae=vae, torch_dtype=torch.bfloat16, cache_dir=MODELS_DIR
-    ).to("cuda")
+    _pipe.to("cuda")
 
-    # Memory-friendly toggles (defensive)
+    # Memory-friendly toggles
     try: _pipe.enable_attention_slicing("max")
     except Exception: pass
     try: _pipe.enable_vae_slicing()
@@ -81,24 +79,36 @@ def _ensure_pipe():
             if pipe is None:
                 pipe = _load_pipeline()
 
-# Warmup so first real job is fast(er)
+# ---- Warmup in background (non-blocking startup)
 WARMUP = os.getenv("WARMUP", "1") == "1"
+
 @app.on_event("startup")
-def _warmup():
+def _startup():
     if not WARMUP:
         return
-    try:
-        _ensure_pipe()
-        _ = pipe(prompt="warmup", height=192, width=320, num_frames=8,
-                 num_inference_steps=4, guidance_scale=3.5)
-    except Exception as e:
-        print("Warmup error:", e)
+    def _bg():
+        try:
+            _ensure_pipe()
+            # tiny warm pass (all /16)
+            _ = pipe(prompt="warmup", height=192, width=320, num_frames=4,
+                     num_inference_steps=3, guidance_scale=3.0)
+            print("Warmup done.")
+        except Exception as e:
+            print("Warmup error:", e)
+    threading.Thread(target=_bg, daemon=True).start()
 
 def _run_job(job_id: str, req: GenerateRequest):
     import torch
     from diffusers.utils import export_to_video
     try:
         _ensure_pipe()
+
+        # snap sizes to multiples of 16 (diffusers requirement)
+        def _floor16(x: int) -> int:
+            return max(256, (int(x) // 16) * 16)
+        w16 = _floor16(req.width)
+        h16 = _floor16(req.height)
+
         gen = None
         if req.seed is not None:
             gen = torch.Generator(device="cuda").manual_seed(int(req.seed))
@@ -116,12 +126,17 @@ def _run_job(job_id: str, req: GenerateRequest):
                 kw["generator"] = gen
             return pipe(**kw)
 
-        # Try user params first; on OOM, auto-fallback to safe profile
+        # try user (snapped) first; on OOM, auto-fallback safer + optional cpu offload
         try:
-            out = do_infer(req.width, req.height, req.num_frames, req.steps)
+            out = do_infer(w16, h16, req.num_frames, req.steps)
         except torch.cuda.OutOfMemoryError:
+            try:
+                if hasattr(pipe, "enable_model_cpu_offload"):
+                    pipe.enable_model_cpu_offload()
+            except Exception:
+                pass
             torch.cuda.empty_cache()
-            out = do_infer(960, 540, min(25, req.num_frames), min(28, req.steps))
+            out = do_infer(960, 544, min(25, req.num_frames), min(28, req.steps))
 
         frames = out.frames[0]
         out_path = os.path.join(OUT_DIR, f"{job_id}.mp4")
