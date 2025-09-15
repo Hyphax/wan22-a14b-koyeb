@@ -18,14 +18,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 COPY requirements.txt /app/requirements.txt
-
-# Install deps (Torch 2.5.1 + CUDA 12.1 + extras) from requirements
 RUN pip install --no-cache-dir -r requirements.txt
-
-# Make sure hub client is recent
 RUN pip install --no-cache-dir --upgrade huggingface_hub==0.25.2
-
-# Wan 2.2 needs diffusers from GitHub (latest)
 RUN pip install --no-cache-dir "git+https://github.com/huggingface/diffusers"
 
 COPY app /app/app
